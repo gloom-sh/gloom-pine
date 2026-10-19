@@ -20,7 +20,7 @@ hline(-2, "Lower")
 gloomberb install gloom-sh/gloom-pine
 ```
 
-The plugin needs Gloom 0.17.7 or later; an older app does not load it and says which version it needs. It runs in the terminal app and the desktop app. The web app cannot install plugins.
+The plugin needs Gloom 0.18.0 or later; an older app does not load it and says which version it needs. It runs in the terminal app and the desktop app. The web app cannot install plugins.
 
 A script runs on your machine with the app's access to it. Only paste scripts you trust.
 

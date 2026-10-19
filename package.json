@@ -18,7 +18,7 @@
     "pinets": "0.11.1"
   },
   "peerDependencies": {
-    "gloomberb": ">=0.17.7",
+    "gloomberb": ">=0.18.0",
     "react": ">=19"
   },
   "peerDependenciesMeta": {

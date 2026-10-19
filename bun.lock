@@ -13,7 +13,7 @@
         "typescript": "^5.9.3",
       },
       "peerDependencies": {
-        "gloomberb": ">=0.17.7",
+        "gloomberb": ">=0.18.0",
         "react": ">=19",
       },
       "optionalPeers": [
