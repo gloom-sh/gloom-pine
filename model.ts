@@ -26,6 +26,10 @@ export interface ScriptLine {
   id: string;
   name: string;
   style: LineStyle;
+  /** The colour the script gives the line, `#rrggbb`; the chart picks one when it gives none. */
+  color?: string;
+  /** Another line's id: the script fills the area between the two. */
+  fill?: string;
 }
 
 export interface ScriptInput {

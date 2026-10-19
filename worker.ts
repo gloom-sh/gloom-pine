@@ -1,13 +1,18 @@
 /**
  * A script worker: runs one script at a time off the app's thread, so a
- * script that never ends is stopped by terminating the worker (runner.ts)
- * and never freezes the app.
+ * script that never ends, or grows without end, is stopped by terminating the
+ * worker (runner.ts) and never freezes the app. It asks the app for bars and
+ * has no other way out.
  */
 import { describeError, runScript, ScriptFailure } from "./engine";
 import type { Candle } from "./model";
 import type { FromWorker, ToWorker } from "./protocol";
+import { hardenWorker } from "./worker-guard";
 
 declare const self: Worker;
+
+// After the imports above: from here on nothing in this worker reaches files, processes or the network.
+hardenWorker();
 
 let nextRequestId = 1;
 const pendingBars = new Map<number, { resolve: (bars: Candle[]) => void; reject: (error: Error) => void }>();

@@ -1,14 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "fs";
 import { validateSeriesDefinition, type LoadedSeriesDefinition, type SeriesLinesLoadResult } from "gloomberb/time-series";
+import { ScriptRunner } from "./runner";
 import { PineService, checkBars } from "./service";
 
 const example = (name: string) => readFileSync(new URL(`./examples/${name}.pine`, import.meta.url), "utf8");
 
-function fakeContext() {
+function fakeContext(currency = "USD") {
   const state = new Map<string, unknown>();
   const series = new Map<string, LoadedSeriesDefinition>();
-  const historyCalls: Array<{ ticker: string; range: string; resolution: string }> = [];
+  const historyCalls: Array<{ ticker: string; exchange: string; range: string; resolution: string }> = [];
   const bars = checkBars(600, 3);
   const ctx = {
     persistence: {
@@ -23,8 +24,9 @@ function fakeContext() {
     },
     marketData: {
       async getPriceHistory() { return []; },
-      async getPriceHistoryForResolutionWithMetadata(ticker: string, _exchange: string, range: string, resolution: string) {
-        historyCalls.push({ ticker, range, resolution });
+      async getQuoteMetadata(symbol: string) { return { symbol, currency, source: {} }; },
+      async getPriceHistoryForResolutionWithMetadata(ticker: string, exchange: string, range: string, resolution: string) {
+        historyCalls.push({ ticker, exchange, range, resolution });
         return { points: bars.map((bar) => ({ date: new Date(bar.openTime), open: bar.open, high: bar.high, low: bar.low, close: bar.close, volume: bar.volume })) };
       },
     },
@@ -65,7 +67,7 @@ describe("PineService", () => {
     expect(result.lines!.overbought!.at(-1)!.value).toBe(70);
     // A second line of the same chart reuses the run.
     await definition.load({ ticker: "AAPL", resolution: "1d", start: new Date(Date.now() - 365 * 86_400_000) });
-    expect(historyCalls).toEqual([{ ticker: "AAPL", range: "5Y", resolution: "1d" }]);
+    expect(historyCalls).toEqual([{ ticker: "AAPL", exchange: "", range: "5Y", resolution: "1d" }]);
 
     const cross = await service.save({ source: example("ma-cross") });
     const overlay = series.get(`pine:${cross.id}`)!;
@@ -99,7 +101,62 @@ describe("PineService", () => {
 
     const second = serviceFor(ctx);
     expect(second.list().map((entry) => entry.id)).toEqual([script.id]);
-    expect(series.get(`pine:${script.id}`)?.lines?.map((line) => line.id)).toEqual(["basis", "upper", "lower"]);
+    // Each line in the script's colour; the band between the outer two takes the edge nearer the fill's blue.
+    expect(series.get(`pine:${script.id}`)?.lines?.map(({ id, color, fill }) => ({ id, color, fill }))).toEqual([
+      { id: "basis", color: "#2962ff", fill: undefined },
+      { id: "upper", color: "#f23645", fill: undefined },
+      { id: "lower", color: "#089981", fill: "upper" },
+    ]);
+  });
+
+  test("a script reads the listing it runs on: its currency, its time zone, and the same listing from request.security", async () => {
+    const { ctx, series, historyCalls } = fakeContext("CHF");
+    const service = serviceFor(ctx);
+    const script = await service.save({ source: `//@version=6
+indicator("Listing")
+plot(syminfo.currency == "CHF" ? 1 : 0, "Currency")
+plot(syminfo.timezone == "Europe/Zurich" ? 1 : 0, "Zone")
+plot(syminfo.tickerid == "XSWX:NESN" ? 1 : 0, "Id")
+plot(request.security(syminfo.tickerid, "W", close), "Weekly")` });
+    historyCalls.length = 0;
+    const result = await series.get(`pine:${script.id}`)!.load({ ticker: "NESN:XSWX", resolution: "1d" }) as SeriesLinesLoadResult;
+    const last = (id: string) => result.lines![id]!.at(-1)!.value;
+    expect([last("currency"), last("zone"), last("id")]).toEqual([1, 1, 1]);
+    expect(historyCalls.map(({ ticker, exchange, resolution }) => `${ticker}:${exchange} ${resolution}`)).toEqual(["NESN:XSWX 1d", "NESN:XSWX 1wk"]);
+  });
+
+  test("a run two charts share stops when both have closed, not when one has", async () => {
+    const real = new ScriptRunner();
+    const runs: AbortSignal[] = [];
+    const runner = {
+      run: (request: { symbol: string }, loadBars: never, signal?: AbortSignal) => request.symbol === "CHECK"
+        ? real.run(request as never, loadBars)
+        : new Promise((_, reject) => {
+          runs.push(signal!);
+          signal!.addEventListener("abort", () => reject(signal!.reason));
+        }),
+      dispose: () => real.dispose(),
+    };
+    const { ctx, series } = fakeContext();
+    const service = new PineService(ctx, runner as never);
+    services.push(service);
+    const script = await service.save({ source: example("rsi-bands") });
+    const definition = series.get(`pine:${script.id}`)!;
+    const first = new AbortController();
+    const second = new AbortController();
+    const one = Promise.resolve(definition.load({ ticker: "AAPL", resolution: "1d", signal: first.signal })).catch((error: unknown) => error);
+    const two = Promise.resolve(definition.load({ ticker: "AAPL", resolution: "1d", signal: second.signal })).catch((error: unknown) => error);
+    while (runs.length === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+    first.abort("closed");
+    expect(await one).toBe("closed");
+    expect(runs.map((signal) => signal.aborted)).toEqual([false]);
+    second.abort("closed");
+    expect(await two).toBe("closed");
+    expect(runs.map((signal) => signal.aborted)).toEqual([true]);
+    // The next chart starts over rather than reading the stopped run.
+    void Promise.resolve(definition.load({ ticker: "AAPL", resolution: "1d" })).catch(() => {});
+    while (runs.length === 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(runs).toHaveLength(2);
   });
 
   test("a renamed script keeps its name when its title changes", async () => {

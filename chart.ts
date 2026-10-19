@@ -1,8 +1,8 @@
 /**
  * The chart a script opens on: the ticker's candles with the script's lines
- * over them (`overlay=true`) or in a panel of their own under them. The same
- * chart the data catalog opens for the script, built here so the desktop
- * view, which does not run scripts, can open it too.
+ * over them (`overlay=true`) or in a panel of their own under them: the
+ * chart the data catalog opens for the script, built here from what the
+ * pane already has, in the terminal and in the desktop view alike.
  */
 import { CHART_SPEC_VERSION, type ChartSeriesSpec, type ChartSpec } from "gloomberb/time-series";
 import { SERIES_NAMESPACE, type PineScript, type ScriptInfo } from "./model";
@@ -34,13 +34,14 @@ export function scriptChartSpec(script: Pick<PineScript, "id" | "name">, info: P
     transform: "raw",
     axis: "auto",
     panelId,
-    style: line.style,
-    interpolation: line.style === "step" ? "step-after" : "none",
+    // A line filled to another draws as a band, as the data catalog draws it.
+    style: line.fill ? "band" : line.style,
+    interpolation: line.style === "step" && !line.fill ? "step-after" : "none",
   }));
   return {
     version: CHART_SPEC_VERSION,
-    // Daily bars, enough of them to read a long average.
-    viewport: { range: "1Y", resolution: "auto" },
+    // CAT's range for the same chart, so the pane and CAT open the same thing.
+    viewport: { range: "5Y", resolution: "auto" },
     panels: [
       { id: "main" },
       { id: "volume", label: "Volume", height: 0.24 },

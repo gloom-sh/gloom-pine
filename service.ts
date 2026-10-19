@@ -6,6 +6,7 @@
 import type { CapabilityOperation, PluginCapability } from "gloomberb/capabilities";
 import type { LoadedSeriesDefinition, ManualChartResolution, SeriesLoadRequest, SeriesPoint } from "gloomberb/time-series";
 import type { GloomPluginContext } from "gloomberb/types/plugin";
+import { resolveExchangeTimeZone } from "gloomberb/utils";
 import { loadCandles, pineTimeframe, resolutionOfTimeframe, splitTicker } from "./bars";
 import type { RunRequest } from "./engine";
 import {
@@ -73,6 +74,34 @@ function readScripts(value: unknown): PineScript[] {
   ));
 }
 
+/**
+ * One run every chart asking for the same script, ticker and bars shares. It
+ * stops when every chart that asked has closed, and not before: a chart that
+ * asked without a way to cancel keeps it.
+ */
+interface SharedRun {
+  at: number;
+  output: Promise<ScriptOutput>;
+  controller: AbortController;
+  waiting: number;
+  kept: boolean;
+}
+
+/** Waits for a shared run, or for this caller's own chart to close, whichever is first. */
+function waitFor<T>(output: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return output;
+  return new Promise<T>((resolve, reject) => {
+    const reason = () => signal.reason ?? new DOMException("Aborted", "AbortError");
+    if (signal.aborted) {
+      reject(reason());
+      return;
+    }
+    const onAbort = () => reject(reason());
+    signal.addEventListener("abort", onAbort, { once: true });
+    output.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
 export interface SaveInput {
   /** Absent for a new script. */
   id?: string;
@@ -83,7 +112,9 @@ export interface SaveInput {
 export class PineService {
   private scripts: PineScript[];
   private readonly registered = new Map<string, { key: string; dispose: () => void }>();
-  private readonly results = new Map<string, { at: number; output: Promise<ScriptOutput> }>();
+  private readonly results = new Map<string, SharedRun>();
+  /** Each ticker's currency, read once. */
+  private readonly currencies = new Map<string, Promise<string | undefined>>();
   private disposed = false;
 
   constructor(
@@ -205,8 +236,16 @@ export class PineService {
       placement: info.overlay ? "price" : "panel",
       refreshMs: REFRESH_MS,
       ...(multi
-        ? { lines: info.lines.map((line) => ({ id: line.id, name: seriesLabel(line.name, 60), style: line.style })) }
-        : { style: info.lines[0]!.style }),
+        ? {
+          lines: info.lines.map((line) => ({
+            id: line.id,
+            name: seriesLabel(line.name, 60),
+            style: line.style,
+            ...(line.color ? { color: line.color } : {}),
+            ...(line.fill ? { fill: line.fill } : {}),
+          })),
+        }
+        : { style: info.lines[0]!.style, ...(info.lines[0]!.color ? { color: info.lines[0]!.color } : {}) }),
       load: (request) => this.load(script.id, request),
     };
     try {
@@ -224,17 +263,29 @@ export class PineService {
     if (!ticker) throw new Error(`${script.name} needs a ticker.`);
     const resolution: ManualChartResolution = request.resolution ?? "1d";
     const minute = request.start ? Math.floor(request.start.getTime() / 60_000) : "all";
+    request.signal?.throwIfAborted();
     const cacheKey = JSON.stringify([id, script.updatedAt, ticker, resolution, minute]);
     const now = Date.now();
-    let cached = this.results.get(cacheKey);
-    if (!cached || now - cached.at > RESULT_TTL_MS) {
-      const output = this.run(script, ticker, resolution, request.start);
-      cached = { at: now, output };
-      this.results.set(cacheKey, cached);
-      output.catch(() => { if (this.results.get(cacheKey) === cached) this.results.delete(cacheKey); });
+    let shared = this.results.get(cacheKey);
+    if (!shared || now - shared.at > RESULT_TTL_MS) {
+      const controller = new AbortController();
+      const output = this.run(script, ticker, resolution, request.start, controller.signal);
+      const entry: SharedRun = { at: now, output, controller, waiting: 0, kept: false };
+      shared = entry;
+      this.results.set(cacheKey, entry);
+      output.catch(() => { if (this.results.get(cacheKey) === entry) this.results.delete(cacheKey); });
       while (this.results.size > MAX_RESULTS) this.results.delete(this.results.keys().next().value!);
     }
-    const output = await cached.output;
+    const entry = shared;
+    if (!request.signal) entry.kept = true;
+    else if (!request.signal.aborted) {
+      entry.waiting += 1;
+      request.signal.addEventListener("abort", () => {
+        entry.waiting -= 1;
+        if (!entry.kept && entry.waiting === 0) entry.controller.abort(request.signal!.reason);
+      }, { once: true });
+    }
+    const output = await waitFor(entry.output, request.signal);
     const points = (values: Array<[number, number | null]> | undefined): SeriesPoint[] => (values ?? []).map(([time, value]) => ({ date: time, value }));
     const lines = script.check?.ok ? script.check.info.lines : [];
     if (lines.length > 1) {
@@ -243,17 +294,61 @@ export class PineService {
     return { points: points(output.values[lines[0]?.id ?? ""] ?? Object.values(output.values)[0]) };
   }
 
-  private async run(script: PineScript, ticker: string, resolution: ManualChartResolution, start: Date | undefined): Promise<ScriptOutput> {
+  /** The ticker's quote currency, when the app knows it; a script's `syminfo.currency`. */
+  private currencyOf(ticker: string): Promise<string | undefined> {
+    let currency = this.currencies.get(ticker);
+    if (!currency) {
+      const { symbol, exchange } = splitTicker(ticker);
+      const marketData = this.ctx.marketData;
+      currency = Promise.resolve()
+        .then(() => (marketData.getQuoteMetadata
+          ? marketData.getQuoteMetadata(symbol, exchange || undefined).then((metadata) => metadata?.currency)
+          : marketData.getQuote(symbol, exchange || undefined).then((quote) => quote.currency)))
+        .then((value) => (typeof value === "string" && /^[A-Z]{3}$/.test(value) ? value : undefined))
+        .catch(() => {
+          // Intentional ignore: without a quote the script reads USD, as it would elsewhere.
+          this.currencies.delete(ticker);
+          return undefined;
+        });
+      this.currencies.set(ticker, currency);
+    }
+    return currency;
+  }
+
+  private async run(script: PineScript, ticker: string, resolution: ManualChartResolution, start: Date | undefined, signal: AbortSignal): Promise<ScriptOutput> {
     const marketData = this.ctx.marketData;
-    const bars = await loadCandles(marketData, ticker, resolution, start ? { start } : {});
+    const [bars, currency] = await Promise.all([
+      loadCandles(marketData, ticker, resolution, start ? { start } : {}),
+      this.currencyOf(ticker),
+    ]);
     if (bars.length === 0) throw new Error(`No ${resolution} bars for ${ticker}.`);
-    const request: RunRequest = { source: script.source, symbol: splitTicker(ticker).symbol, timeframe: pineTimeframe(resolution), bars };
+    signal.throwIfAborted();
+    const { symbol, exchange } = splitTicker(ticker);
+    const timezone = exchange ? resolveExchangeTimeZone(exchange) : null;
+    const request: RunRequest = {
+      source: script.source,
+      symbol,
+      ...(exchange ? { exchange } : {}),
+      timeframe: pineTimeframe(resolution),
+      bars,
+      ...(currency ? { currency } : {}),
+      ...(timezone ? { timezone } : {}),
+    };
     try {
       return await this.runner.run(request, async (asked) => {
         const askedResolution = resolutionOfTimeframe(asked.timeframe);
         if (!askedResolution) throw new Error(`Timeframe "${asked.timeframe}" is not available.`);
-        return loadCandles(marketData, asked.symbol, askedResolution, asked.start !== undefined ? { start: asked.start } : {});
-      });
+        const options = asked.start !== undefined ? { start: asked.start } : {};
+        // A Pine prefix Gloom does not know as a listing (`BATS:AAPL`) reads the symbol alone; the chart's own listing never does.
+        const bare = asked.symbol.toUpperCase() === ticker.toUpperCase() ? asked.symbol : splitTicker(asked.symbol).symbol;
+        try {
+          const listed = await loadCandles(marketData, asked.symbol, askedResolution, options);
+          if (listed.length > 0 || bare === asked.symbol) return listed;
+        } catch (error) {
+          if (bare === asked.symbol) throw error;
+        }
+        return loadCandles(marketData, bare, askedResolution, options);
+      }, signal);
     } catch (error) {
       if (error instanceof ScriptRunError) throw new Error(`${script.name}: ${formatScriptError(error.detail)}`);
       throw error;

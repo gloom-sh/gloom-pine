@@ -13,10 +13,22 @@ export type BarsLoader = (request: { symbol: string; timeframe: string; start?: 
 export interface RunRequest {
   source: string;
   symbol: string;
+  /** The listing, as Gloom names it (`XSWX` for `NESN:XSWX`); none for a US listing. */
+  exchange?: string;
   /** Pine timeframe of the bars: `D`, `W`, `M`, `60`, `5`. */
   timeframe: string;
   bars: Candle[];
+  /** `syminfo.currency`. */
   currency?: string;
+  /** `syminfo.timezone`: the listing's own, which `time()` and sessions are read in. */
+  timezone?: string;
+}
+
+/** `NASDAQ:AAPL` as Pine writes a symbol: its prefix, if any, and the symbol. */
+function pineSymbol(tickerId: string): { prefix: string; symbol: string } {
+  const text = String(tickerId ?? "").trim().toUpperCase();
+  const colon = text.indexOf(":");
+  return colon > 0 ? { prefix: text.slice(0, colon), symbol: text.slice(colon + 1) } : { prefix: "", symbol: text };
 }
 
 /** A chart holds ten series: the ticker's price and up to eight of a script's lines. */
@@ -52,7 +64,7 @@ const NOT_DRAWN: Record<string, string> = {
   candle: "plotcandle",
   background: "bgcolor",
   barcolor: "barcolor",
-  fill: "fill",
+  // `fill()` between two plots is drawn (readPlots); one between drawn lines (`linefill`) is not.
   linefill: "fill",
   label: "labels",
   drawing_line: "lines",
@@ -87,20 +99,83 @@ function hasDrawings(data: unknown): boolean {
 
 interface PlotEntry {
   title?: string;
-  options?: { style?: string; display?: string };
-  data?: Array<{ time: number; value: unknown }>;
+  options?: { style?: string; display?: string; color?: unknown; plot1?: string; plot2?: string };
+  data?: Array<{ time: number; value: unknown; options?: { color?: unknown } }>;
 }
 
-/** The lines a finished run drew, in the order the script declared them, with what it drew that a chart cannot. */
+const NAMED_COLORS: Record<string, string> = {
+  aqua: "#00bcd4", black: "#363a45", blue: "#2962ff", fuchsia: "#e040fb", gray: "#787b86", green: "#4caf50",
+  lime: "#00e676", maroon: "#880e4f", navy: "#311b92", olive: "#808000", orange: "#ff9800", purple: "#9c27b0",
+  red: "#f23645", silver: "#b2b5be", teal: "#089981", white: "#ffffff", yellow: "#fdd835",
+};
+
+/** A colour the runtime gives (`#rgb`, `#rrggbb`, `#rrggbbaa`, `rgb()`, `rgba()`, a name) as `#rrggbb`, its transparency dropped. */
+function hexColor(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.trim().toLowerCase();
+  const short = /^#([0-9a-f])([0-9a-f])([0-9a-f])$/.exec(text);
+  if (short) return `#${short[1]}${short[1]}${short[2]}${short[2]}${short[3]}${short[3]}`;
+  const long = /^#([0-9a-f]{6})(?:[0-9a-f]{2})?$/.exec(text);
+  if (long) return `#${long[1]}`;
+  const rgb = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(text);
+  if (rgb) return `#${rgb.slice(1, 4).map((part) => Math.min(255, Number(part)).toString(16).padStart(2, "0")).join("")}`;
+  return NAMED_COLORS[text.replace(/^color\./, "")] ?? null;
+}
+
+const HLINE_GRAY = "#787b86";
+
+/** Whether a colour shows at all: `na` and a fully transparent colour (`color.new(c, 100)`) do not. */
+function shows(value: unknown): boolean {
+  if (typeof value !== "string" || !hexColor(value)) return false;
+  const text = value.trim().toLowerCase();
+  const hexAlpha = /^#[0-9a-f]{6}([0-9a-f]{2})$/.exec(text);
+  if (hexAlpha) return hexAlpha[1] !== "00";
+  const rgbaAlpha = /^rgba\([^)]*,\s*([\d.]+)\s*\)$/.exec(text);
+  return rgbaAlpha ? Number(rgbaAlpha[1]) > 0 : true;
+}
+
+/**
+ * The colour a script gives a plot over the bars it has a value on: the most
+ * common one, whether it changes bar by bar (`na` on some bars counts), and
+ * whether it shows at all. A plot given no colour has none here, so the chart
+ * picks one.
+ */
+function plotLook(plot: PlotEntry): { color: string | null; perBar: boolean; hidden: boolean } {
+  const given = plot.options?.color;
+  const counts = new Map<string, number>();
+  let drawn = 0;
+  for (const point of plot.data ?? []) {
+    if (finite(point.value) === null) continue;
+    drawn += 1;
+    const color = point.options?.color;
+    const key = shows(color) ? hexColor(color)! : "none";
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  if (given === undefined) return { color: null, perBar: false, hidden: false };
+  if (drawn === 0) return { color: shows(given) ? hexColor(given) : null, perBar: false, hidden: !shows(given) };
+  const visible = [...counts].filter(([key]) => key !== "none").sort((a, b) => b[1] - a[1]);
+  return { color: visible[0]?.[0] ?? null, perBar: counts.size > 1, hidden: visible.length === 0 };
+}
+
+/**
+ * The lines a finished run drew, in the order the script declared them, with
+ * what it drew that a chart cannot. A `fill()` between two drawn lines shades
+ * from the first to the second; one between anything else is not drawn. A plot
+ * the script hides (`color=na`, fully transparent) is not drawn, unless a fill
+ * needs it as an edge.
+ */
 export function readPlots(plots: Record<string, PlotEntry>): { lines: Array<ScriptLine & { values: Array<[number, number | null]> }>; notDrawn: string[] } {
-  const lines: Array<ScriptLine & { values: Array<[number, number | null]> }> = [];
   const notDrawn = new Set<string>();
-  const taken = new Set<string>();
-  let index = 0;
+  const fills: Array<{ from?: string; to?: string; color: string | null }> = [];
+  const candidates: Array<{ key: string; plot: PlotEntry; style: LineStyle; isHline: boolean; look: ReturnType<typeof plotLook> }> = [];
   for (const [key, plot] of Object.entries(plots ?? {})) {
     const style = plot?.options?.style;
     if (key.startsWith("__")) {
       if (style && NOT_DRAWN[style] && hasDrawings(plot.data)) notDrawn.add(NOT_DRAWN[style]!);
+      continue;
+    }
+    if (style === "fill") {
+      fills.push({ from: plot.options?.plot1, to: plot.options?.plot2, color: plotLook(plot).color });
       continue;
     }
     if (style && NOT_DRAWN[style]) {
@@ -109,19 +184,59 @@ export function readPlots(plots: Record<string, PlotEntry>): { lines: Array<Scri
     }
     if (plot?.options?.display === "none") continue;
     const isHline = style === "hline";
-    const drawStyle: LineStyle = isHline ? "line" : PLOT_STYLES[style ?? "style_line"] ?? "line";
+    candidates.push({ key, plot, style: isHline ? "line" : PLOT_STYLES[style ?? "style_line"] ?? "line", isHline, look: plotLook(plot) });
+  }
+  const keys = new Set(candidates.map((candidate) => candidate.key));
+  const drawnFills = fills.filter((fill) => fill.from && fill.to && fill.from !== fill.to && keys.has(fill.from) && keys.has(fill.to));
+  // A hidden plot a fill shades to is drawn in the fill's colour: the chart's band needs both edges.
+  const edgeColor = new Map<string, string | null>();
+  for (const fill of drawnFills) for (const key of [fill.from!, fill.to!]) if (!edgeColor.has(key)) edgeColor.set(key, fill.color);
+
+  const lines: Array<ScriptLine & { values: Array<[number, number | null]> }> = [];
+  const byKey = new Map<string, ScriptLine>();
+  const taken = new Set<string>();
+  let index = 0;
+  for (const { key, plot, style, isHline, look } of candidates) {
+    if (look.hidden && !edgeColor.has(key)) continue;
     const values = (plot.data ?? []).map((point): [number, number | null] => [point.time, finite(point.value)]);
     const title = plot.title ?? key;
     const firstValue = values.find(([, value]) => value !== null)?.[1] ?? null;
-    lines.push({
+    if (look.perBar && !look.hidden) notDrawn.add("per-bar colors");
+    // An hline the script gives no colour is Pine's grey, as everywhere else it is drawn.
+    const color = look.hidden ? edgeColor.get(key) : look.color ?? (isHline ? HLINE_GRAY : null);
+    const line = {
       id: lineId(title, index, taken),
       name: lineName(title, index, isHline ? "hline" : "plot", firstValue),
-      style: drawStyle,
+      style,
+      ...(color ? { color } : {}),
       values,
-    });
+    };
+    lines.push(line);
+    byKey.set(key, line);
     index += 1;
   }
+  for (const fill of fills) {
+    const first = fill.from ? byKey.get(fill.from) : undefined;
+    const second = fill.to ? byKey.get(fill.to) : undefined;
+    // A line shades to one other line, in its own colour: the edge whose colour is nearer the fill's takes it.
+    // A second fill from both edges, or one to a plot not drawn, is not drawn.
+    const edges = first && second && first !== second ? [first, second].filter((line) => !line.fill) : [];
+    if (edges.length === 0) {
+      notDrawn.add("fill");
+      continue;
+    }
+    const [edge] = edges.sort((a, b) => colorDistance(a.color, fill.color) - colorDistance(b.color, fill.color));
+    edge!.fill = (edge === first ? second : first)!.id;
+  }
   return { lines, notDrawn: [...notDrawn] };
+}
+
+/** How far apart two `#rrggbb` colours look, roughly; an unknown one is as far as can be. */
+function colorDistance(a: string | undefined, b: string | null): number {
+  if (!a || !b) return Number.MAX_SAFE_INTEGER;
+  const channels = (hex: string) => [1, 3, 5].map((at) => parseInt(hex.slice(at, at + 2), 16));
+  const [x, y] = [channels(a), channels(b)];
+  return x.reduce((sum, value, index) => sum + (value - y[index]!) ** 2, 0);
 }
 
 function readInputs(indicator: Indicator): ScriptInput[] {
@@ -238,19 +353,26 @@ export function describeError(error: unknown, source: string): ScriptError {
   return { message: message || "The script failed." };
 }
 
-/** The runtime's input data for one symbol: Gloom bars as PineTS klines. */
+/**
+ * The runtime's input data: Gloom bars as PineTS klines. The chart's ticker
+ * is `XSWX:NESN` to the script, as Pine writes it, and a symbol the script
+ * asks for keeps its prefix, so another listing of the same name is not read
+ * by mistake.
+ */
 function provider(request: RunRequest, loadBars: BarsLoader) {
   const main = request.symbol.toUpperCase();
+  const exchange = (request.exchange ?? "").toUpperCase();
   return {
     async getMarketData(tickerId: string, timeframe: string, limit?: number, sDate?: number, eDate?: number) {
-      const symbol = String(tickerId ?? "").replace(/^[A-Z]+:(?=[^:]+$)/i, "").toUpperCase() || main;
+      const asked = pineSymbol(tickerId);
+      const symbol = asked.symbol || main;
       const sameTimeframe = !timeframe || timeframe === request.timeframe
         || (resolutionOfTimeframe(timeframe) ?? timeframe) === (resolutionOfTimeframe(request.timeframe) ?? request.timeframe);
-      if ((symbol === main || symbol === "") && sameTimeframe) {
-        return request.bars;
-      }
+      const isMain = symbol === main && (asked.prefix === "" || asked.prefix === exchange);
+      if (isMain && sameTimeframe) return request.bars;
       return loadBars({
-        symbol,
+        // Gloom writes the listing after the symbol.
+        symbol: isMain && exchange ? `${main}:${exchange}` : asked.prefix && !isMain ? `${symbol}:${asked.prefix}` : symbol,
         timeframe: timeframe || request.timeframe,
         ...(sDate !== undefined ? { start: sDate } : {}),
         ...(eDate !== undefined ? { end: eDate } : {}),
@@ -258,17 +380,20 @@ function provider(request: RunRequest, loadBars: BarsLoader) {
       });
     },
     async getSymbolInfo(tickerId: string) {
-      const symbol = String(tickerId ?? main).toUpperCase();
+      const asked = pineSymbol(tickerId || main);
+      const symbol = asked.symbol || main;
+      const isMain = symbol === main && (asked.prefix === "" || asked.prefix === exchange);
+      const prefix = isMain ? exchange : asked.prefix;
       return {
         ticker: symbol,
-        tickerid: symbol,
+        tickerid: prefix ? `${prefix}:${symbol}` : symbol,
         root: symbol,
-        prefix: "",
+        prefix,
         description: symbol,
-        currency: request.currency ?? "USD",
+        currency: (isMain ? request.currency : undefined) ?? "USD",
         basecurrency: "",
         type: "stock",
-        timezone: "America/New_York",
+        timezone: (isMain ? request.timezone : undefined) ?? "America/New_York",
         session: "regular",
         mintick: 0.01,
         pricescale: 100,
@@ -294,7 +419,8 @@ export async function runScript(request: RunRequest, loadBars: BarsLoader): Prom
   const inputs = readInputs(indicator);
   let context: unknown;
   try {
-    const pine = new PineTS(provider(request, loadBars) as never, request.symbol, request.timeframe, request.bars.length);
+    const tickerId = request.exchange ? `${request.exchange.toUpperCase()}:${request.symbol.toUpperCase()}` : request.symbol;
+    const pine = new PineTS(provider(request, loadBars) as never, tickerId, request.timeframe, request.bars.length);
     context = await pine.run(indicator);
   } catch (error) {
     throw new ScriptFailure(describeError(error, request.source));
@@ -315,10 +441,18 @@ export async function runScript(request: RunRequest, loadBars: BarsLoader): Prom
       .slice(0, MAX_LINES)
       .sort((a, b) => plotted.indexOf(a) - plotted.indexOf(b));
   if (plotted.length > MAX_LINES) notDrawn.push(`${plotted.length - MAX_LINES} more plots (a chart shows ${MAX_LINES})`);
+  // A fill to a line past the eight is not drawn either.
+  const kept = new Set(lines.map((line) => line.id));
+  for (const line of lines) {
+    if (line.fill && !kept.has(line.fill)) {
+      delete line.fill;
+      if (!notDrawn.includes("fill")) notDrawn.push("fill");
+    }
+  }
   const info: ScriptInfo = {
     title: declared?.title?.trim() || "Script",
     overlay: declared?.overlay === true,
-    lines: lines.map(({ id, name, style }) => ({ id, name, style })),
+    lines: lines.map(({ values: _values, ...line }) => line),
     notDrawn,
     inputs,
     strategy: indicator.getDeclarationType() === "strategy",
