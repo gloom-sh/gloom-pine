@@ -124,6 +124,10 @@ function hexColor(value: unknown): string | null {
 
 const HLINE_GRAY = "#787b86";
 
+function isUnknownColor(value: unknown): boolean {
+  return typeof value === "string" && /^#0{8}$/.test(value.trim());
+}
+
 /** Whether a colour shows at all: `na` and a fully transparent colour (`color.new(c, 100)`) do not. */
 function shows(value: unknown): boolean {
   if (typeof value !== "string" || !hexColor(value)) return false;
@@ -143,16 +147,16 @@ function shows(value: unknown): boolean {
 function plotLook(plot: PlotEntry): { color: string | null; perBar: boolean; hidden: boolean } {
   const given = plot.options?.color;
   const counts = new Map<string, number>();
-  let drawn = 0;
   for (const point of plot.data ?? []) {
-    if (finite(point.value) === null) continue;
-    drawn += 1;
     const color = point.options?.color;
+    // Transparent black is what the runtime gives for a colour it could not work out (a gradient of
+    // input colours): not a colour the script chose, so the chart picks one.
+    if (finite(point.value) === null || isUnknownColor(color)) continue;
     const key = shows(color) ? hexColor(color)! : "none";
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
-  if (given === undefined) return { color: null, perBar: false, hidden: false };
-  if (drawn === 0) return { color: shows(given) ? hexColor(given) : null, perBar: false, hidden: !shows(given) };
+  if (given === undefined || (counts.size === 0 && isUnknownColor(given))) return { color: null, perBar: false, hidden: false };
+  if (counts.size === 0) return { color: shows(given) ? hexColor(given) : null, perBar: false, hidden: !shows(given) };
   const visible = [...counts].filter(([key]) => key !== "none").sort((a, b) => b[1] - a[1]);
   return { color: visible[0]?.[0] ?? null, perBar: counts.size > 1, hidden: visible.length === 0 };
 }
