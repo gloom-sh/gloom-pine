@@ -1,0 +1,37 @@
+{
+  "name": "gloom-pine",
+  "version": "0.1.0",
+  "description": "Pine Script indicators on Gloom charts, for any ticker",
+  "type": "module",
+  "main": "index.ts",
+  "browser": "index.browser.ts",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gloom-sh/gloom-pine"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "pinets": "0.11.1"
+  },
+  "peerDependencies": {
+    "gloomberb": ">=0.18.0",
+    "react": ">=19"
+  },
+  "peerDependenciesMeta": {
+    "gloomberb": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/react": "^19.2.7",
+    "typescript": "^5.9.3"
+  }
+}

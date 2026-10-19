@@ -1,0 +1,7 @@
+//@version=6
+indicator("MA cross", overlay=true)
+fast = ta.sma(close, input.int(20, "Fast"))
+slow = ta.sma(close, input.int(50, "Slow"))
+plot(fast, "Fast", color=color.orange)
+plot(slow, "Slow", color=#2962ff)
+plotshape(ta.crossover(fast, slow), "Cross up", shape.triangleup, location.belowbar)

@@ -1,0 +1,7 @@
+//@version=6
+indicator("Z-score", overlay=false)
+length = input.int(20, "Length")
+z = (close - ta.sma(close, length)) / ta.stdev(close, length)
+plot(z, "Z", color=color.teal)
+hline(2, "Upper")
+hline(-2, "Lower")
