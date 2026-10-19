@@ -1,0 +1,26 @@
+{
+  "id": "pine",
+  "name": "Pine Scripts",
+  "icon": "icon.svg",
+  "tagline": "Paste a Pine Script indicator and chart it on any ticker",
+  "description": "Paste a Pine Script v5 or v6 indicator and see it on Gloom charts for any ticker, in the terminal and the desktop app. Overlay scripts draw on the price, others in a panel of their own. Scripts are saved with your profile, run on your machine, and appear in the data catalog and the chart's add-series search.",
+  "categories": [
+    "charts",
+    "research"
+  ],
+  "targets": [
+    "cli",
+    "tui",
+    "desktop"
+  ],
+  "hosts": [],
+  "contributes": {
+    "panes": [
+      "pine"
+    ],
+    "capabilities": [
+      "pine-scripts"
+    ]
+  },
+  "minGloom": "0.17.7"
+}

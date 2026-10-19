@@ -1,0 +1,6 @@
+//@version=6
+indicator("RSI with bands")
+r = ta.rsi(close, input.int(14, "Length"))
+plot(r, "RSI")
+hline(70, "Overbought")
+hline(30, "Oversold")

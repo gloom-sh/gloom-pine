@@ -1,0 +1,7 @@
+//@version=6
+indicator("Bollinger Bands", overlay=true)
+[basis, upper, lower] = ta.bb(close, input.int(20, "Length"), input.float(2.0, "Deviations"))
+plot(basis, "Basis")
+p1 = plot(upper, "Upper")
+p2 = plot(lower, "Lower")
+fill(p1, p2)
