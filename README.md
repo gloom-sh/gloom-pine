@@ -41,13 +41,13 @@ Saved scripts work for any ticker, and they show up in three places:
 ## Limits
 
 - Only Pine Script v5 and v6 indicators run. For v4 and older scripts the pane asks you to convert them first. Strategies run, but only their plots are drawn.
-- A chart draws up to 8 `plot()` and `hline()` lines per script. Some features are not drawn, and the pane lists them under the editor: shapes, chars and arrows, `bgcolor`, `barcolor`, plotted candles and bars, labels, lines, boxes, polylines and tables.
+- A chart draws up to 16 `plot()` and `hline()` lines per script, or as many as the app allows: Gloom 0.18.0 and 0.18.1 allow 8. The pane lists the lines left out. Some features are not drawn, and the pane lists them under the editor: shapes, chars and arrows, `bgcolor`, `barcolor`, plotted candles and bars, labels, lines, boxes, polylines and tables.
 - A line has one colour. A line whose colour changes bar by bar is drawn in its most common colour, and the pane lists "per-bar colors". A plot hidden with `color=na` is not drawn.
 - A `fill()` is shaded between two drawn lines, in the colour of whichever line is nearer the fill's. A line takes one fill; a second one, and fills between other things, are not drawn.
 - Libraries (`import`) are not supported.
 - `request.security()` works for other tickers and for 1, 5, 15, 30 and 45 minute, 1 hour, daily, weekly and monthly bars.
 - Inputs always use their defaults. To change one, edit its default in the script.
-- A script runs over the chart's bars plus 300 earlier bars, so long averages are already settled on the first bar you see.
+- A script runs over the chart's bars plus 300 earlier bars, so long averages are already settled on the first bar you see. Minute and hour bars are kept for a limited time (60 days of 5-minute bars for some tickers). When the chart and those 300 bars reach back further, the script runs on the bars the source keeps, with fewer earlier bars, and the chart's own notice says where its bars start.
 - Scripts run one at a time, each with 10 seconds and 1 GB of memory. A script that needs more is stopped, and the app keeps working. Closing a chart stops its script.
 - Scripts are saved with your profile and run on your machine. They are never uploaded. Their bars come from Gloom Cloud, the same as any chart.
 - You can keep up to 100 scripts, each up to 200,000 characters long.

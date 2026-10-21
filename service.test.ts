@@ -6,10 +6,11 @@ import { PineService, checkBars } from "./service";
 
 const example = (name: string) => readFileSync(new URL(`./examples/${name}.pine`, import.meta.url), "utf8");
 
-function fakeContext(currency = "USD") {
+function fakeContext(currency = "USD", keptDays?: number) {
   const state = new Map<string, unknown>();
   const series = new Map<string, LoadedSeriesDefinition>();
   const historyCalls: Array<{ ticker: string; exchange: string; range: string; resolution: string }> = [];
+  const windowCalls: Array<{ ticker: string; from: number }> = [];
   const bars = checkBars(600, 3);
   const ctx = {
     persistence: {
@@ -29,10 +30,28 @@ function fakeContext(currency = "USD") {
         historyCalls.push({ ticker, exchange, range, resolution });
         return { points: bars.map((bar) => ({ date: new Date(bar.openTime), open: bar.open, high: bar.high, low: bar.low, close: bar.close, volume: bar.volume })) };
       },
+      // Minute and hour bars from a source that keeps its bars for `keptDays` days only.
+      async getDetailedPriceHistoryWithMetadata(ticker: string, _exchange: string, from: Date, to: Date) {
+        windowCalls.push({ ticker, from: from.getTime() });
+        const first = to.getTime() - (keptDays ?? 365) * 86_400_000;
+        if (from.getTime() < first) {
+          throw Object.assign(new Error("Requested history precedes the source retention window"), {
+            name: "HistoryRetentionError",
+            retention: { availableStart: first, observedAt: to.getTime() },
+          });
+        }
+        const hours = Math.floor((to.getTime() - from.getTime()) / 3_600_000);
+        return {
+          points: Array.from({ length: hours }, (_, index) => {
+            const close = 100 + Math.sin(index / 20);
+            return { date: new Date(from.getTime() + index * 3_600_000), open: close, high: close + 1, low: close - 1, close, volume: 1_000 };
+          }),
+        };
+      },
     },
     log: { warn() {}, info() {}, error() {}, debug() {} },
   };
-  return { ctx: ctx as never, state, series, historyCalls };
+  return { ctx: ctx as never, state, series, historyCalls, windowCalls };
 }
 
 let services: PineService[] = [];
@@ -74,6 +93,20 @@ describe("PineService", () => {
     expect(overlay.placement).toBe("price");
     expect(overlay.unit).toBe("currency");
     expect(cross.check?.ok && cross.check.info.notDrawn).toEqual(["plotshape"]);
+  });
+
+  test("hourly bars from before what the source keeps chart on the bars it keeps", async () => {
+    const { ctx, series, windowCalls } = fakeContext("USD", 60);
+    const service = serviceFor(ctx);
+    const script = await service.save({ source: example("z-score") });
+    const definition = series.get(`pine:${script.id}`)!;
+
+    // A year of hourly bars from a source that keeps two months.
+    const start = new Date(Date.now() - 365 * 86_400_000);
+    const result = await definition.load({ ticker: "ES=F", resolution: "1h", start }) as SeriesLinesLoadResult;
+    expect(windowCalls).toHaveLength(2);
+    expect(windowCalls[1]!.from).toBeGreaterThan(windowCalls[0]!.from);
+    expect(result.lines!.z!.filter((point) => point.value !== null).length).toBeGreaterThan(1_000);
   });
 
   test("keeps a script that does not run, says where it fails, and lists it once it is fixed", async () => {

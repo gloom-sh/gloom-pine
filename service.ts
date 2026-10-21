@@ -6,9 +6,10 @@
 import type { CapabilityOperation, PluginCapability } from "gloomberb/capabilities";
 import type { LoadedSeriesDefinition, ManualChartResolution, SeriesLoadRequest, SeriesPoint } from "gloomberb/time-series";
 import type { GloomPluginContext } from "gloomberb/types/plugin";
+import { validateSeriesDefinition } from "gloomberb/time-series";
 import { resolveExchangeTimeZone } from "gloomberb/utils";
 import { loadCandles, pineTimeframe, resolutionOfTimeframe, splitTicker } from "./bars";
-import type { RunRequest } from "./engine";
+import { MAX_LINES, type RunRequest } from "./engine";
 import {
   defaultScriptName,
   formatScriptError,
@@ -64,6 +65,29 @@ export function checkBars(count = CHECK_BARS, seed = 7): Candle[] {
   return bars;
 }
 
+/**
+ * The most lines one series may draw in this app, up to `MAX_LINES`: the app's
+ * own check says, so a script is never registered with more lines than it takes.
+ */
+export function hostLineLimit(): number {
+  for (let count = MAX_LINES; count > 1; count -= 1) {
+    try {
+      validateSeriesDefinition({
+        id: "pine:limit",
+        name: "Limit",
+        unit: "points",
+        frequency: "irregular",
+        lines: Array.from({ length: count }, (_, index) => ({ id: `line-${index + 1}`, name: `Line ${index + 1}` })),
+        load: async () => ({ lines: {} }),
+      });
+      return count;
+    } catch {
+      // Intentional ignore: this app takes fewer lines.
+    }
+  }
+  return 1;
+}
+
 function readScripts(value: unknown): PineScript[] {
   if (!Array.isArray(value)) return [];
   return value.filter((entry): entry is PineScript => (
@@ -116,6 +140,7 @@ export class PineService {
   /** Each ticker's currency, read once. */
   private readonly currencies = new Map<string, Promise<string | undefined>>();
   private disposed = false;
+  private readonly maxLines = hostLineLimit();
 
   constructor(
     private readonly ctx: Pick<GloomPluginContext, "persistence" | "registerSeries" | "marketData" | "log">,
@@ -138,7 +163,7 @@ export class PineService {
     const checkedAt = Date.now();
     try {
       const bars = checkBars();
-      const output = await this.runner.run({ source, symbol: "CHECK", timeframe: "D", bars }, async () => bars);
+      const output = await this.runner.run({ source, symbol: "CHECK", timeframe: "D", bars, maxLines: this.maxLines }, async () => bars);
       return { ok: true, info: output.info, checkedAt };
     } catch (error) {
       return {
@@ -333,6 +358,7 @@ export class PineService {
       bars,
       ...(currency ? { currency } : {}),
       ...(timezone ? { timezone } : {}),
+      maxLines: this.maxLines,
     };
     try {
       return await this.runner.run(request, async (asked) => {

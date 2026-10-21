@@ -22,6 +22,8 @@ export interface RunRequest {
   currency?: string;
   /** `syminfo.timezone`: the listing's own, which `time()` and sessions are read in. */
   timezone?: string;
+  /** The most lines the app draws for one script, when it takes fewer than `MAX_LINES`. */
+  maxLines?: number;
 }
 
 /** `NASDAQ:AAPL` as Pine writes a symbol: its prefix, if any, and the symbol. */
@@ -31,8 +33,8 @@ function pineSymbol(tickerId: string): { prefix: string; symbol: string } {
   return colon > 0 ? { prefix: text.slice(0, colon), symbol: text.slice(colon + 1) } : { prefix: "", symbol: text };
 }
 
-/** A chart holds ten series: the ticker's price and up to eight of a script's lines. */
-export const MAX_LINES = 8;
+/** The most lines of one script a chart draws, when the app takes that many. */
+export const MAX_LINES = 16;
 
 /** Thrown with a message a person can act on, and the place in the script when there is one. */
 export class ScriptFailure extends Error {
@@ -436,16 +438,17 @@ export async function runScript(request: RunRequest, loadBars: BarsLoader): Prom
   };
   const declared = ctx.indicator ?? ctx.strategy?.config;
   const { lines: plotted, notDrawn } = readPlots(ctx.plots);
-  // Past eight, the plots that drew something on these bars come first: a script
+  // Past the limit, the plots that drew something on these bars come first: a script
   // often declares plots its default inputs leave empty before the ones it shows.
+  const limit = Math.max(1, Math.min(request.maxLines ?? MAX_LINES, MAX_LINES));
   const drawing = new Set(plotted.filter((line) => line.values.some(([, value]) => value !== null)));
-  const lines = plotted.length <= MAX_LINES
+  const lines = plotted.length <= limit
     ? plotted
     : [...plotted.filter((line) => drawing.has(line)), ...plotted.filter((line) => !drawing.has(line))]
-      .slice(0, MAX_LINES)
+      .slice(0, limit)
       .sort((a, b) => plotted.indexOf(a) - plotted.indexOf(b));
-  if (plotted.length > MAX_LINES) notDrawn.push(`${plotted.length - MAX_LINES} more plots (a chart shows ${MAX_LINES})`);
-  // A fill to a line past the eight is not drawn either.
+  if (plotted.length > limit) notDrawn.push(`${plotted.length - limit} more plots (a chart shows ${limit})`);
+  // A fill to a line past the limit is not drawn either.
   const kept = new Set(lines.map((line) => line.id));
   for (const line of lines) {
     if (line.fill && !kept.has(line.fill)) {
