@@ -152,3 +152,14 @@ test("runs take turns, and a chart closed while its run waits or runs stops it",
   expect((await after).values["sma-3"]).toHaveLength(10);
   turns.dispose();
 });
+
+test("lines past what the app takes for one script are named, and the ones that drew come first", async () => {
+  const plots = Array.from({ length: 12 }, (_, index) => `plot(${index === 0 ? "na" : `close + ${index}`}, "Line ${index + 1}")`).join("\n");
+  const source = `//@version=6\nindicator("Many", overlay=true)\n${plots}`;
+  const limited = await runner.run({ source, symbol: "TEST", timeframe: "D", bars: bars(30), maxLines: 5 }, noBars);
+  // The first plot has no values on these bars, so it is the first to go.
+  expect(limited.info.lines.map((line) => line.name)).toEqual(["Line 2", "Line 3", "Line 4", "Line 5", "Line 6"]);
+  expect(limited.info.notDrawn).toEqual(["7 more plots (a chart shows 5)"]);
+  const all = await runner.run({ source, symbol: "TEST", timeframe: "D", bars: bars(30) }, noBars);
+  expect(all.info.lines).toHaveLength(12);
+});
