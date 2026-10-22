@@ -4,7 +4,7 @@
  * can loop for as long as it likes, and only a worker can be stopped.
  */
 import { Indicator, PineTS } from "pinets";
-import { resolutionOfTimeframe } from "./bars";
+import { barSizeOfTimeframe } from "./bars";
 import type { Candle, LineStyle, ScriptError, ScriptInfo, ScriptInput, ScriptLine, ScriptOutput } from "./model";
 
 /** What the runtime asks for when a script calls `request.security()` on another symbol or timeframe. */
@@ -373,7 +373,7 @@ function provider(request: RunRequest, loadBars: BarsLoader) {
       const asked = pineSymbol(tickerId);
       const symbol = asked.symbol || main;
       const sameTimeframe = !timeframe || timeframe === request.timeframe
-        || (resolutionOfTimeframe(timeframe) ?? timeframe) === (resolutionOfTimeframe(request.timeframe) ?? request.timeframe);
+        || (barSizeOfTimeframe(timeframe) ?? timeframe) === (barSizeOfTimeframe(request.timeframe) ?? request.timeframe);
       const isMain = symbol === main && (asked.prefix === "" || asked.prefix === exchange);
       if (isMain && sameTimeframe) return request.bars;
       return loadBars({
