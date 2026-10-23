@@ -4,11 +4,11 @@
  * pane reaches it through the `pine-scripts` capability wherever it renders.
  */
 import type { CapabilityOperation, PluginCapability } from "gloomberb/capabilities";
-import type { LoadedSeriesDefinition, ManualChartResolution, SeriesLoadRequest, SeriesPoint } from "gloomberb/time-series";
+import type { LoadedSeriesDefinition, SeriesLoadRequest, SeriesPoint } from "gloomberb/time-series";
 import type { GloomPluginContext } from "gloomberb/types/plugin";
-import { validateSeriesDefinition } from "gloomberb/time-series";
+import * as timeSeries from "gloomberb/time-series";
 import { resolveExchangeTimeZone } from "gloomberb/utils";
-import { loadCandles, pineTimeframe, resolutionOfTimeframe, splitTicker } from "./bars";
+import { barSizeOfTimeframe, isSourceSize, loadCandles, pineTimeframe, splitTicker, type BarAggregator, type BarRequest } from "./bars";
 import { MAX_LINES, type RunRequest } from "./engine";
 import {
   defaultScriptName,
@@ -72,7 +72,7 @@ export function checkBars(count = CHECK_BARS, seed = 7): Candle[] {
 export function hostLineLimit(): number {
   for (let count = MAX_LINES; count > 1; count -= 1) {
     try {
-      validateSeriesDefinition({
+      timeSeries.validateSeriesDefinition({
         id: "pine:limit",
         name: "Limit",
         unit: "points",
@@ -111,6 +111,38 @@ interface SharedRun {
   kept: boolean;
 }
 
+/**
+ * Builds bars of a size the source does not serve from its shorter ones, the
+ * way the app's charts build them (aligned to the session's open, multi-day
+ * bars counting trading days), on the exchange the quote lists when the ticker
+ * names none. Read from the module rather than imported by name, so the plugin
+ * still loads on an app from before it, where every chart draws bars its
+ * source serves.
+ */
+function aggregatorFor(listedExchange: string | undefined): BarAggregator | undefined {
+  const aggregate = (timeSeries as Partial<typeof timeSeries>).aggregatePriceBars;
+  if (!aggregate) return undefined;
+  return (points, size, listing) => aggregate(
+    points.map((point) => ({ ...point, date: new Date(point.date) }) as Parameters<typeof aggregate>[0][number]),
+    size as never,
+    { symbol: listing.symbol, exchange: listing.exchange || listedExchange || "" },
+  );
+}
+
+/** The bars of a size a script asks for with `request.security()`, and the source bars they are built from. */
+function barsOf(size: string): BarRequest {
+  if (isSourceSize(size)) return { size, source: size };
+  const sourceOf = (timeSeries as Partial<typeof timeSeries>).chartBarSizeSource;
+  if (!sourceOf) throw new Error(`${size} bars need a newer version of Gloom.`);
+  return { size, source: sourceOf(size as never) };
+}
+
+/** What the app knows of a ticker's listing. */
+interface Listing {
+  currency?: string;
+  exchange?: string;
+}
+
 /** Waits for a shared run, or for this caller's own chart to close, whichever is first. */
 function waitFor<T>(output: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (!signal) return output;
@@ -137,8 +169,8 @@ export class PineService {
   private scripts: PineScript[];
   private readonly registered = new Map<string, { key: string; dispose: () => void }>();
   private readonly results = new Map<string, SharedRun>();
-  /** Each ticker's currency, read once. */
-  private readonly currencies = new Map<string, Promise<string | undefined>>();
+  /** Each ticker's currency and exchange, read once. */
+  private readonly listings = new Map<string, Promise<Listing>>();
   private disposed = false;
   private readonly maxLines = hostLineLimit();
 
@@ -286,15 +318,17 @@ export class PineService {
     if (!script) throw new Error("This script was deleted.");
     const ticker = request.ticker?.trim();
     if (!ticker) throw new Error(`${script.name} needs a ticker.`);
-    const resolution: ManualChartResolution = request.resolution ?? "1d";
+    const resolution = request.resolution ?? "1d";
+    // A chart of 4h bars asks for the 1h bars they are built from and says it draws 4h ones.
+    const bars: BarRequest = { size: request.barSize ?? resolution, source: resolution };
     const minute = request.start ? Math.floor(request.start.getTime() / 60_000) : "all";
     request.signal?.throwIfAborted();
-    const cacheKey = JSON.stringify([id, script.updatedAt, ticker, resolution, minute]);
+    const cacheKey = JSON.stringify([id, script.updatedAt, ticker, bars.size, bars.source, minute]);
     const now = Date.now();
     let shared = this.results.get(cacheKey);
     if (!shared || now - shared.at > RESULT_TTL_MS) {
       const controller = new AbortController();
-      const output = this.run(script, ticker, resolution, request.start, controller.signal);
+      const output = this.run(script, ticker, bars, request.start, controller.signal);
       const entry: SharedRun = { at: now, output, controller, waiting: 0, kept: false };
       shared = entry;
       this.results.set(cacheKey, entry);
@@ -319,34 +353,50 @@ export class PineService {
     return { points: points(output.values[lines[0]?.id ?? ""] ?? Object.values(output.values)[0]) };
   }
 
-  /** The ticker's quote currency, when the app knows it; a script's `syminfo.currency`. */
-  private currencyOf(ticker: string): Promise<string | undefined> {
-    let currency = this.currencies.get(ticker);
-    if (!currency) {
+  /**
+   * The ticker's quote currency (a script's `syminfo.currency`) and the
+   * exchange it lists on, when the app knows them. Bars built from shorter
+   * ones start on that exchange's session open, as the chart's do.
+   */
+  private listingOf(ticker: string): Promise<Listing> {
+    let listing = this.listings.get(ticker);
+    if (!listing) {
       const { symbol, exchange } = splitTicker(ticker);
       const marketData = this.ctx.marketData;
-      currency = Promise.resolve()
-        .then(() => (marketData.getQuoteMetadata
-          ? marketData.getQuoteMetadata(symbol, exchange || undefined).then((metadata) => metadata?.currency)
-          : marketData.getQuote(symbol, exchange || undefined).then((quote) => quote.currency)))
-        .then((value) => (typeof value === "string" && /^[A-Z]{3}$/.test(value) ? value : undefined))
-        .catch(() => {
-          // Intentional ignore: without a quote the script reads USD, as it would elsewhere.
-          this.currencies.delete(ticker);
-          return undefined;
+      listing = Promise.resolve()
+        .then((): Promise<{ currency?: string; listingExchangeName?: string; exchangeName?: string } | null> => (marketData.getQuoteMetadata
+          ? marketData.getQuoteMetadata(symbol, exchange || undefined)
+          : marketData.getQuote(symbol, exchange || undefined)))
+        .then((quote): Listing => {
+          const currency = quote?.currency;
+          const listed = quote?.listingExchangeName?.trim() || quote?.exchangeName?.trim();
+          return {
+            ...(typeof currency === "string" && /^[A-Z]{3}$/.test(currency) ? { currency } : {}),
+            ...(exchange || listed ? { exchange: exchange || listed } : {}),
+          };
+        })
+        .catch((): Listing => {
+          // Intentional ignore: without a quote the script reads USD, as it would elsewhere, and bars start on the clock.
+          this.listings.delete(ticker);
+          return exchange ? { exchange } : {};
         });
-      this.currencies.set(ticker, currency);
+      this.listings.set(ticker, listing);
     }
-    return currency;
+    return listing;
   }
 
-  private async run(script: PineScript, ticker: string, resolution: ManualChartResolution, start: Date | undefined, signal: AbortSignal): Promise<ScriptOutput> {
-    const marketData = this.ctx.marketData;
-    const [bars, currency] = await Promise.all([
-      loadCandles(marketData, ticker, resolution, start ? { start } : {}),
-      this.currencyOf(ticker),
+  /** Bars of a ticker for a run; a size its source does not serve waits for the listing, to start on its session's open. */
+  private async candlesOf(ticker: string, bars: BarRequest, window: { start?: Date | number }): Promise<Candle[]> {
+    const listed = bars.size === bars.source ? undefined : (await this.listingOf(ticker)).exchange;
+    return loadCandles(this.ctx.marketData, ticker, bars, window, Date.now(), aggregatorFor(listed));
+  }
+
+  private async run(script: PineScript, ticker: string, bars: BarRequest, start: Date | undefined, signal: AbortSignal): Promise<ScriptOutput> {
+    const [candles, listing] = await Promise.all([
+      this.candlesOf(ticker, bars, start ? { start } : {}),
+      this.listingOf(ticker),
     ]);
-    if (bars.length === 0) throw new Error(`No ${resolution} bars for ${ticker}.`);
+    if (candles.length === 0) throw new Error(`No ${bars.size} bars for ${ticker}.`);
     signal.throwIfAborted();
     const { symbol, exchange } = splitTicker(ticker);
     const timezone = exchange ? resolveExchangeTimeZone(exchange) : null;
@@ -354,26 +404,27 @@ export class PineService {
       source: script.source,
       symbol,
       ...(exchange ? { exchange } : {}),
-      timeframe: pineTimeframe(resolution),
-      bars,
-      ...(currency ? { currency } : {}),
+      timeframe: pineTimeframe(bars.size),
+      bars: candles,
+      ...(listing.currency ? { currency: listing.currency } : {}),
       ...(timezone ? { timezone } : {}),
       maxLines: this.maxLines,
     };
     try {
       return await this.runner.run(request, async (asked) => {
-        const askedResolution = resolutionOfTimeframe(asked.timeframe);
-        if (!askedResolution) throw new Error(`Timeframe "${asked.timeframe}" is not available.`);
+        const size = barSizeOfTimeframe(asked.timeframe);
+        if (!size) throw new Error(`Timeframe "${asked.timeframe}" is not available.`);
+        const askedBars = barsOf(size);
         const options = asked.start !== undefined ? { start: asked.start } : {};
         // A Pine prefix Gloom does not know as a listing (`BATS:AAPL`) reads the symbol alone; the chart's own listing never does.
         const bare = asked.symbol.toUpperCase() === ticker.toUpperCase() ? asked.symbol : splitTicker(asked.symbol).symbol;
         try {
-          const listed = await loadCandles(marketData, asked.symbol, askedResolution, options);
+          const listed = await this.candlesOf(asked.symbol, askedBars, options);
           if (listed.length > 0 || bare === asked.symbol) return listed;
         } catch (error) {
           if (bare === asked.symbol) throw error;
         }
-        return loadCandles(marketData, bare, askedResolution, options);
+        return this.candlesOf(bare, askedBars, options);
       }, signal);
     } catch (error) {
       if (error instanceof ScriptRunError) throw new Error(`${script.name}: ${formatScriptError(error.detail)}`);

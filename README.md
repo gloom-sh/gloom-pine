@@ -30,6 +30,8 @@ A script runs on your machine with the app's access to it. Only paste scripts yo
 2. Press `n`, paste a script and press `Ctrl+S`. If the script does not run, the error shows under the editor with its line.
 3. Press `g`, type a ticker, and the chart opens.
 
+A script runs on the chart's bars: on a 4h chart `timeframe.period` is `"240"` and each bar holds four hourly bars from the session's open, on a 2D chart it is `"2D"`. Bars the source does not serve are built the way the chart builds them, so the script's values fall on the chart's bars.
+
 `overlay=true` scripts draw over the price. Other scripts get their own panel under the price. Each `plot()` and `hline()` is a line in the colour the script gives it, a `fill()` between two of them is shaded, and inputs keep their defaults. More examples are in [examples](examples).
 
 Saved scripts work for any ticker, and they show up in three places:
@@ -45,7 +47,7 @@ Saved scripts work for any ticker, and they show up in three places:
 - A line has one colour. A line whose colour changes bar by bar is drawn in its most common colour, and the pane lists "per-bar colors". A plot hidden with `color=na` is not drawn.
 - A `fill()` is shaded between two drawn lines, in the colour of whichever line is nearer the fill's. A line takes one fill; a second one, and fills between other things, are not drawn.
 - Libraries (`import`) are not supported.
-- `request.security()` works for other tickers and for 1, 5, 15, 30 and 45 minute, 1 hour, daily, weekly and monthly bars.
+- `request.security()` works for other tickers and for any count of minutes, hours, days, weeks or months up to a day, a year or 12 months (`"10"`, `"240"`, `"4H"`, `"2D"`, `"3M"`). Seconds and ticks are not available. On a Gloom without custom bar sizes it takes only 1, 5, 15, 30 and 45 minute, 1 hour, daily, weekly and monthly bars.
 - Inputs always use their defaults. To change one, edit its default in the script.
 - A script runs over the chart's bars plus 300 earlier bars, so long averages are already settled on the first bar you see. Minute and hour bars are kept for a limited time (60 days of 5-minute bars for some tickers). When the chart and those 300 bars reach back further, the script runs on the bars the source keeps, with fewer earlier bars, and the chart's own notice says where its bars start.
 - Scripts run one at a time, each with 10 seconds and 1 GB of memory. A script that needs more is stopped, and the app keeps working. Closing a chart stops its script.

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { DataProvider } from "gloomberb/types/data-provider";
-import { loadCandles } from "./bars";
+import { barSizeOfTimeframe, loadCandles, pineTimeframe } from "./bars";
 
 const MINUTE = 60_000;
 const DAY = 86_400_000;
@@ -64,5 +64,22 @@ describe("loadCandles", () => {
   test("an error that is not about retention is not retried", async () => {
     const marketData = { async getDetailedPriceHistoryWithMetadata() { throw new Error("rate limited"); } } as unknown as DataProvider;
     await expect(loadCandles(marketData, "ES=F", "5m", { start: new Date(NOW - DAY) }, NOW)).rejects.toThrow("rate limited");
+  });
+});
+
+describe("timeframes", () => {
+  test("a chart's bar size reads as Pine writes it, and back", () => {
+    const sizes = ["1m", "10m", "45m", "1h", "2h", "4h", "1d", "2d", "3d", "1wk", "2wk", "1mo", "3mo"];
+    expect(sizes.map(pineTimeframe)).toEqual(["1", "10", "45", "60", "120", "240", "D", "2D", "3D", "W", "2W", "M", "3M"]);
+    expect(sizes.map((size) => barSizeOfTimeframe(pineTimeframe(size)))).toEqual(sizes);
+    // Pine also writes hours with an H and one day as 1D; seconds and bars longer than Gloom builds are not served.
+    expect(["4H", "1D", "12M", "30S", "1T", "1441", "13M", "53W"].map(barSizeOfTimeframe)).toEqual(["4h", "1d", "12mo", null, null, null, null, null]);
+  });
+
+  test("bars an app from before built sizes cannot build are refused with what to do", async () => {
+    const { marketData, calls } = source({ keptDays: 60, stepMinutes: 60 });
+    await expect(loadCandles(marketData, "ES=F", { size: "4h", source: "1h" }, { start: new Date(NOW - DAY) }, NOW))
+      .rejects.toThrow("4h bars need a newer version of Gloom.");
+    expect(calls).toHaveLength(0);
   });
 });

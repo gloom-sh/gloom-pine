@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "fs";
-import { validateSeriesDefinition, type LoadedSeriesDefinition, type SeriesLinesLoadResult } from "gloomberb/time-series";
+import { validateSeriesDefinition, type LoadedSeriesDefinition, type SeriesLinesLoadResult, type SeriesLoadResult } from "gloomberb/time-series";
 import { ScriptRunner } from "./runner";
 import { PineService, checkBars } from "./service";
 
@@ -107,6 +107,44 @@ describe("PineService", () => {
     expect(windowCalls).toHaveLength(2);
     expect(windowCalls[1]!.from).toBeGreaterThan(windowCalls[0]!.from);
     expect(result.lines!.z!.filter((point) => point.value !== null).length).toBeGreaterThan(1_000);
+  });
+
+  test("a 4h chart runs the script on 4h bars built from the hourly ones, and the script reads 240", async () => {
+    const { ctx, series, windowCalls } = fakeContext();
+    const service = serviceFor(ctx);
+    const script = await service.save({ source: "//@version=6\nindicator(\"Bar size\")\nplot(timeframe.multiplier * (timeframe.isintraday ? 1 : -1), \"tf\")\n" });
+    const definition = series.get(`pine:${script.id}`)!;
+
+    const start = new Date(Date.now() - 20 * 86_400_000);
+    const result = await definition.load({ ticker: "AAPL:NASDAQ", resolution: "1h", barSize: "4h", start }) as SeriesLoadResult;
+    expect(windowCalls.length).toBeGreaterThan(0);
+    const points = result.points;
+    expect(new Set(points.map((point) => point.value))).toEqual(new Set([240]));
+    // Each bar of a session starts on the 09:30 open or four hours on from it, never on the hourly bars between.
+    // (The fake source has bars around the clock; real ones stop overnight and at weekends.)
+    const sessionMinutes = points.flatMap((point) => {
+      const parts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", weekday: "short", hour: "numeric", minute: "numeric", hourCycle: "h23" })
+        .formatToParts(new Date(point.date));
+      const part = (type: string) => parts.find((entry) => entry.type === type)!.value;
+      const minute = Number(part("hour")) * 60 + Number(part("minute"));
+      return ["Sat", "Sun"].includes(part("weekday")) || minute < 570 || minute >= 960 ? [] : [minute];
+    });
+    expect(sessionMinutes.length).toBeGreaterThan(20);
+    expect(new Set(sessionMinutes)).toEqual(new Set([570, 810]));
+    const steps = points.slice(1).map((point, index) => new Date(point.date).getTime() - new Date(points[index]!.date).getTime());
+    expect(steps.filter((step) => step === 4 * 3_600_000).length).toBeGreaterThan(points.length / 2);
+  });
+
+  test("a 2D chart runs the script on two-day bars and the script reads 2D", async () => {
+    const { ctx, series, historyCalls } = fakeContext();
+    const service = serviceFor(ctx);
+    const script = await service.save({ source: "//@version=6\nindicator(\"Bar size\")\nplot(timeframe.isdaily ? timeframe.multiplier : -1, \"tf\")\n" });
+    const result = await series.get(`pine:${script.id}`)!.load({ ticker: "AAPL", resolution: "1d", barSize: "2d" }) as SeriesLoadResult;
+    expect(historyCalls.map((call) => call.resolution)).toEqual(["1d"]);
+    expect(new Set(result.points.map((point) => point.value))).toEqual(new Set([2]));
+    // The check walk has a bar every day: its 600 days hold about 410 of the listing's sessions, which pair up.
+    expect(result.points.length).toBeLessThan(230);
+    expect(result.points.length).toBeGreaterThan(200);
   });
 
   test("keeps a script that does not run, says where it fails, and lists it once it is fixed", async () => {
