@@ -1,16 +1,16 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "fs";
-import { validateSeriesDefinition, type LoadedSeriesDefinition, type SeriesLinesLoadResult, type SeriesLoadResult } from "gloomberb/time-series";
+import { validateSeriesDefinition, type LoadedSeriesDefinition, type SeriesLinesLoadResult, type SeriesLoadRequest, type SeriesLoadResult } from "gloomberb/time-series";
 import { ScriptRunner } from "./runner";
 import { PineService, checkBars } from "./service";
 
 const example = (name: string) => readFileSync(new URL(`./examples/${name}.pine`, import.meta.url), "utf8");
 
-function fakeContext(currency = "USD", keptDays?: number) {
+function fakeContext(currency = "USD", keptDays?: number, servesExtendedHours = true) {
   const state = new Map<string, unknown>();
   const series = new Map<string, LoadedSeriesDefinition>();
   const historyCalls: Array<{ ticker: string; exchange: string; range: string; resolution: string }> = [];
-  const windowCalls: Array<{ ticker: string; from: number }> = [];
+  const windowCalls: Array<{ ticker: string; from: number; session?: string }> = [];
   const bars = checkBars(600, 3);
   const ctx = {
     persistence: {
@@ -31,8 +31,8 @@ function fakeContext(currency = "USD", keptDays?: number) {
         return { points: bars.map((bar) => ({ date: new Date(bar.openTime), open: bar.open, high: bar.high, low: bar.low, close: bar.close, volume: bar.volume })) };
       },
       // Minute and hour bars from a source that keeps its bars for `keptDays` days only.
-      async getDetailedPriceHistoryWithMetadata(ticker: string, _exchange: string, from: Date, to: Date) {
-        windowCalls.push({ ticker, from: from.getTime() });
+      async getDetailedPriceHistoryWithMetadata(ticker: string, _exchange: string, from: Date, to: Date, _barSize: string, context?: { historySession?: string }) {
+        windowCalls.push({ ticker, from: from.getTime(), ...(context?.historySession ? { session: context.historySession } : {}) });
         const first = to.getTime() - (keptDays ?? 365) * 86_400_000;
         if (from.getTime() < first) {
           throw Object.assign(new Error("Requested history precedes the source retention window"), {
@@ -46,6 +46,7 @@ function fakeContext(currency = "USD", keptDays?: number) {
             const close = 100 + Math.sin(index / 20);
             return { date: new Date(from.getTime() + index * 3_600_000), open: close, high: close + 1, low: close - 1, close, volume: 1_000 };
           }),
+          ...(servesExtendedHours && context?.historySession === "extended" ? { extendedHours: true } : {}),
         };
       },
     },
@@ -133,6 +134,37 @@ describe("PineService", () => {
     expect(new Set(sessionMinutes)).toEqual(new Set([570, 810]));
     const steps = points.slice(1).map((point, index) => new Date(point.date).getTime() - new Date(points[index]!.date).getTime());
     expect(steps.filter((step) => step === 4 * 3_600_000).length).toBeGreaterThan(points.length / 2);
+  });
+
+  test("with extended hours a 4h chart runs the script on the pre-market and after-hours bars, from the chart's 04:00 open", async () => {
+    // Where each bar starts in the extended session, 04:00 to 20:00 New York on weekdays.
+    // (The fake source has bars around the clock; real ones stop overnight and at weekends.)
+    const minutesOf = (points: SeriesLoadResult["points"]) => new Set(points.flatMap((point) => {
+      const parts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", weekday: "short", hour: "numeric", minute: "numeric", hourCycle: "h23" })
+        .formatToParts(new Date(point.date));
+      const part = (type: string) => parts.find((entry) => entry.type === type)!.value;
+      const minute = Number(part("hour")) * 60 + Number(part("minute"));
+      return ["Sat", "Sun"].includes(part("weekday")) || minute < 240 || minute >= 1200 ? [] : [minute];
+    }));
+    const source = "//@version=6\nindicator(\"Close\")\nplot(close, \"close\")\n";
+    const start = new Date(Date.now() - 20 * 86_400_000);
+    const request = { ticker: "AAPL:NASDAQ", resolution: "1h", barSize: "4h", extendedHours: true, start } as SeriesLoadRequest;
+
+    const { ctx, series, windowCalls } = fakeContext();
+    const script = await serviceFor(ctx).save({ source });
+    const result = await series.get(`pine:${script.id}`)!.load(request) as SeriesLoadResult;
+    expect(windowCalls.length).toBeGreaterThan(0);
+    expect(windowCalls.every((call) => call.session === "extended")).toBe(true);
+    // Every bar starts four hours on from 04:00 New York, as the chart's do, never at the regular 09:30 open.
+    const minutes = minutesOf(result.points);
+    expect(minutes.has(480) && minutes.has(720)).toBe(true);
+    expect(minutes).toEqual(new Set([240, 480, 720, 960]));
+
+    // A source that serves the regular session only answers without it: the chart then starts at 09:30, and so does the script.
+    const regular = fakeContext("USD", undefined, false);
+    const regularScript = await serviceFor(regular.ctx).save({ source });
+    const fallback = await regular.series.get(`pine:${regularScript.id}`)!.load(request) as SeriesLoadResult;
+    expect(minutesOf(fallback.points).has(570)).toBe(true);
   });
 
   test("a 2D chart runs the script on two-day bars and the script reads 2D", async () => {

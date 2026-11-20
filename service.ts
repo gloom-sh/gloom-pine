@@ -122,19 +122,20 @@ interface SharedRun {
 function aggregatorFor(listedExchange: string | undefined): BarAggregator | undefined {
   const aggregate = (timeSeries as Partial<typeof timeSeries>).aggregatePriceBars;
   if (!aggregate) return undefined;
-  return (points, size, listing) => aggregate(
-    points.map((point) => ({ ...point, date: new Date(point.date) }) as Parameters<typeof aggregate>[0][number]),
-    size as never,
-    { symbol: listing.symbol, exchange: listing.exchange || listedExchange || "" },
-  );
+  return (points, size, listing) => {
+    // The source bars' size, read by an app that takes it, so a thinly traded ticker's bars still start on the boundaries.
+    const options = { symbol: listing.symbol, exchange: listing.exchange || listedExchange || "", resolution: listing.resolution, extendedHours: listing.extendedHours };
+    return aggregate(points.map((point) => ({ ...point, date: new Date(point.date) }) as Parameters<typeof aggregate>[0][number]), size as never, options);
+  };
 }
 
-/** The bars of a size a script asks for with `request.security()`, and the source bars they are built from. */
-function barsOf(size: string): BarRequest {
-  if (isSourceSize(size)) return { size, source: size };
+/** The bars of a size a script asks for with `request.security()`, and the source bars they are built from, in the chart's session. */
+function barsOf(size: string, extendedHours: boolean): BarRequest {
+  const session = extendedHours ? { extendedHours: true } : {};
+  if (isSourceSize(size)) return { size, source: size, ...session };
   const sourceOf = (timeSeries as Partial<typeof timeSeries>).chartBarSizeSource;
   if (!sourceOf) throw new Error(`${size} bars need a newer version of Gloom.`);
-  return { size, source: sourceOf(size as never) };
+  return { size, source: sourceOf(size as never), ...session };
 }
 
 /** What the app knows of a ticker's listing. */
@@ -319,11 +320,15 @@ export class PineService {
     const ticker = request.ticker?.trim();
     if (!ticker) throw new Error(`${script.name} needs a ticker.`);
     const resolution = request.resolution ?? "1d";
-    // A chart of 4h bars asks for the 1h bars they are built from and says it draws 4h ones.
-    const bars: BarRequest = { size: request.barSize ?? resolution, source: resolution };
+    // A chart of 4h bars asks for the 1h bars they are built from and says it draws 4h ones. With
+    // extended hours its minute and hour bars hold the pre-market and after-hours sessions, from 04:00
+    // New York: the script runs on those bars, so its values fall on the chart's. Read by name, so
+    // the plugin still type-checks against an app from before the field.
+    const extendedHours = (request as SeriesLoadRequest & { extendedHours?: boolean }).extendedHours === true;
+    const bars: BarRequest = { size: request.barSize ?? resolution, source: resolution, ...(extendedHours ? { extendedHours } : {}) };
     const minute = request.start ? Math.floor(request.start.getTime() / 60_000) : "all";
     request.signal?.throwIfAborted();
-    const cacheKey = JSON.stringify([id, script.updatedAt, ticker, bars.size, bars.source, minute]);
+    const cacheKey = JSON.stringify([id, script.updatedAt, ticker, bars.size, bars.source, extendedHours, minute]);
     const now = Date.now();
     let shared = this.results.get(cacheKey);
     if (!shared || now - shared.at > RESULT_TTL_MS) {
@@ -414,7 +419,7 @@ export class PineService {
       return await this.runner.run(request, async (asked) => {
         const size = barSizeOfTimeframe(asked.timeframe);
         if (!size) throw new Error(`Timeframe "${asked.timeframe}" is not available.`);
-        const askedBars = barsOf(size);
+        const askedBars = barsOf(size, bars.extendedHours === true);
         const options = asked.start !== undefined ? { start: asked.start } : {};
         // A Pine prefix Gloom does not know as a listing (`BATS:AAPL`) reads the symbol alone; the chart's own listing never does.
         const bare = asked.symbol.toUpperCase() === ticker.toUpperCase() ? asked.symbol : splitTicker(asked.symbol).symbol;

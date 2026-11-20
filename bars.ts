@@ -80,10 +80,20 @@ export function barSizeOfTimeframe(timeframe: string): string | null {
 export interface BarRequest {
   size: string;
   source: ManualChartResolution;
+  /** The chart draws pre-market and after-hours trading: minute and hour bars are asked for with it. */
+  extendedHours?: boolean;
+}
+
+/** How bars are built: the listing, the source bars' size and whether they hold the pre-market and after-hours sessions. */
+export interface BarAggregation {
+  symbol: string;
+  exchange: string;
+  resolution: ManualChartResolution;
+  extendedHours: boolean;
 }
 
 /** Builds bars of a size from the source's shorter ones, as the app's charts do (`aggregatePriceBars`). */
-export type BarAggregator = (points: readonly PriceBar[], size: string, listing: { symbol: string; exchange: string }) => readonly PriceBar[];
+export type BarAggregator = (points: readonly PriceBar[], size: string, listing: BarAggregation) => readonly PriceBar[];
 
 /** Bars a run gets before the first one the chart shows, so averages have warmed up there. */
 export const WARMUP_BARS = 300;
@@ -179,14 +189,19 @@ export async function loadCandles(
   now = Date.now(),
   aggregate?: BarAggregator,
 ): Promise<Candle[]> {
-  const { size, source: resolution } = typeof bars === "string" ? { size: bars, source: bars } : bars;
+  const { size, source: resolution, extendedHours = false } = typeof bars === "string" ? { size: bars, source: bars } : bars;
   if (size !== resolution && !aggregate) throw new Error(`${size} bars need a newer version of Gloom.`);
   const { symbol, exchange } = splitTicker(ticker);
   const sourceMs = barMs(resolution);
   const unit = sizeParts(size)?.unit;
   const warmup = (window.warmupBars ?? WARMUP_BARS) * barMs(size) * (unit === "d" ? 1.5 : isIntraday(size) ? INTRADAY_WARMUP_SPAN : 1);
   const start = window.start !== undefined ? new Date(window.start).getTime() : null;
-  const candlesOf = (points: readonly PriceBar[]) => toCandles(size === resolution ? points : aggregate!(points, size, { symbol, exchange }), size);
+  // The chart's session, as its own history is asked for: only minute and hour bars have one.
+  const context = extendedHours && isIntraday(resolution) ? { historySession: "extended" as const } : undefined;
+  // Built from the session the source answered with, as the chart builds its own: one that serves only the regular
+  // session says so by leaving `extendedHours` off, and an answer that cannot say is taken to be what was asked for.
+  const candlesOf = (points: readonly PriceBar[], served = context !== undefined) => toCandles(size === resolution ? points
+    : aggregate!(points, size, { symbol, exchange, resolution, extendedHours: served }), size);
   const windowed = isIntraday(resolution) && (marketData.getDetailedPriceHistoryWithMetadata || marketData.getDetailedPriceHistory);
   if (windowed) {
     // The bars from `first` to now. A source that keeps only the last weeks or months of them says
@@ -195,10 +210,11 @@ export async function loadCandles(
       let from = first;
       for (let attempt = 1; ; attempt += 1) {
         try {
-          const points = marketData.getDetailedPriceHistoryWithMetadata
-            ? (await marketData.getDetailedPriceHistoryWithMetadata(symbol, exchange, new Date(from), new Date(now), resolution)).points
-            : await marketData.getDetailedPriceHistory!(symbol, exchange, new Date(from), new Date(now), resolution);
-          return candlesOf(points);
+          if (marketData.getDetailedPriceHistoryWithMetadata) {
+            const result = await marketData.getDetailedPriceHistoryWithMetadata(symbol, exchange, new Date(from), new Date(now), resolution, context);
+            return candlesOf(result.points, result.extendedHours === true);
+          }
+          return candlesOf(await marketData.getDetailedPriceHistory!(symbol, exchange, new Date(from), new Date(now), resolution, context));
         } catch (error) {
           const kept = retainedStartOf(error);
           // One whole bar inside the source's window, which moves on while the request is on its way.
@@ -221,14 +237,11 @@ export async function loadCandles(
     return candles;
   }
   const range = start === null ? "ALL" : rangeReaching(start - warmup, now);
-  let points: readonly PriceBar[];
-  if (marketData.getPriceHistoryForResolutionWithMetadata) {
-    points = (await marketData.getPriceHistoryForResolutionWithMetadata(symbol, exchange, range, resolution)).points;
-  } else if (marketData.getPriceHistoryForResolution) {
-    points = await marketData.getPriceHistoryForResolution(symbol, exchange, range, resolution);
-  } else {
-    points = await marketData.getPriceHistory(symbol, exchange, range);
-  }
   // Bars after the window's end stay: a chart clips what it does not show.
-  return candlesOf(points);
+  if (marketData.getPriceHistoryForResolutionWithMetadata) {
+    const result = await marketData.getPriceHistoryForResolutionWithMetadata(symbol, exchange, range, resolution, context);
+    return candlesOf(result.points, result.extendedHours === true);
+  }
+  if (marketData.getPriceHistoryForResolution) return candlesOf(await marketData.getPriceHistoryForResolution(symbol, exchange, range, resolution, context));
+  return candlesOf(await marketData.getPriceHistory(symbol, exchange, range));
 }
