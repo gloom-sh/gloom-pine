@@ -30,7 +30,7 @@ A script runs on your machine with the app's access to it. Only paste scripts yo
 2. Press `n`, paste a script and press `Ctrl+S`. If the script does not run, the error shows under the editor with its line.
 3. Press `g`, type a ticker, and the chart opens.
 
-A script runs on the chart's bars: on a 4h chart `timeframe.period` is `"240"` and each bar holds four hourly bars from the session's open, on a 2D chart it is `"2D"`. Bars the source does not serve are built the way the chart builds them, so the script's values fall on the chart's bars.
+A script runs on the chart's bars: on a 4h chart `timeframe.period` is `"240"` and each bar holds four hourly bars from the session's open, on a 2D chart it is `"2D"`. Bars the source does not serve are built the way the chart builds them, so the script's values fall on the chart's bars. With extended hours on, a minute or hour chart's bars include the pre-market and after-hours sessions and start at 04:00 New York, and so do the script's.
 
 `overlay=true` scripts draw over the price. Other scripts get their own panel under the price. Each `plot()` and `hline()` is a line in the colour the script gives it, a `fill()` between two of them is shaded, and inputs keep their defaults. More examples are in [examples](examples).
 
